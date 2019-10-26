@@ -1,0 +1,475 @@
+---
+title: "Capstone ML : Scotty Time Series Forecasting"
+author: "Faris Dzikrur Rahman"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: leonids
+    highlight: github
+---
+
+The purpose of time series analysis using Online Ride Sharing data di Turkey is to analyze and predict the demand (order) for the next 7 hours for every hours, divided into region/sub-area.  I will use seveal algorithm to make prediction, but only choose one very best algorithm with least error to create final forecast.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(forecast)
+library(purrr)
+library(yardstick)
+library(lubridate)
+library(recipes)
+library(magrittr)
+library(plotly)
+library(MLmetrics)
+```
+
+# Data Preparation
+
+```{r}
+scotty <- read_csv("drive-download-20190915T022902Z-001/scotty-ts-auto/data/data-train.csv")
+data_submission <- read_csv("drive-download-20190915T022902Z-001/scotty-ts-auto/data/data-submission.csv")
+```
+
+```{r}
+str(scotty)
+```
+
+From the structure / glimpse of the data above, we will use start_time (order time) column and length of the status as demand. These demand data will be aggregated each hour to become demand per hour. 
+
+Then, the hourly data will be completed, especially for the hour when there were no demand. This is done so that when we do modelling, the model will be more accurate in predicting those particular condition.
+
+```{r}
+# convert all data to hour
+subarea_scotty <- scotty %>%  
+  mutate(datetime = floor_date(start_time, "hour")) %>% 
+  group_by(src_sub_area, datetime) %>% 
+  summarise(demand = length(status))
+```
+
+```{r}
+# fill NA 
+scotty_fill <- subarea_scotty %>%   
+  complete(datetime = seq(min(subarea_scotty$datetime), max(subarea_scotty$datetime), by = "hour")) %>% 
+  mutate(demand = ifelse(is.na(demand), 0, demand))
+```
+
+Let's check the data once again.
+
+```{r}
+head(scotty_fill)
+tail(scotty_fill)
+```
+
+Below is the demand visualization of each area. 
+
+```{r}
+ggplot(scotty_fill, aes(x = datetime, y = demand)) +
+           geom_line(aes(col = src_sub_area)) +
+           labs(x = "", y = "Demand (order)", title = "Demand per Sub Area") +
+           facet_wrap(~ src_sub_area, scale = "free_y", ncol = 1) +
+           theme(legend.position = "none")
+```
+
+After seeing the hourly, weekly, and monthly data, I decide to use hourly and weekly as a frequency in this model. This decision is taken since the data is unsufficient to predict monthly pattern, because the data only comprises 2 months. 
+
+After deciding which pattern that will be used, I then create visualization of decomposition of hourly and weekly patterm. 
+
+```{r}
+dcm <- scotty_fill %>% filter(src_sub_area == "sxk97") %>% .$demand %>% msts(.,seasonal.periods = c(24,24*7))
+
+autoplot(mstl(dcm)) + labs(title = "Hourly and Weekly Data Decomposition")
+```
+
+From the plot above, it is shown that trend is already smooth, meaning that the pattern that used is already correct. 
+
+Then, we do cross validation by dividing data into train data (to train the model) and test data (to evaluate the model). Test data is obtained from last one week of observation, and the rest will be assigned to train data.
+
+# Cross Validation
+
+```{r}
+# test size
+test_size <- 24 * 7
+
+# determining beginning and ending of train and test data
+test_end <- max(scotty_fill$datetime)
+test_start <- test_end - hours(test_size) + hours(1)
+
+train_end <- test_start - hours(1)
+train_start <- min(scotty_fill$datetime)
+
+intrain <- interval(train_start, train_end)
+intest <- interval(test_start, test_end)
+
+# Apply interval to dataset
+scotty_p <- scotty_fill %>% 
+  mutate(sample = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% intest ~ "test"
+  )) %>% 
+  drop_na()
+
+# inspect the dataset
+head(scotty_p)
+```
+
+We also have to scale the data before we start to do modelling. This is done so that the model will be more robust and insensitive to oulier data. 
+
+```{r}
+# transform data into wide format
+scotty_spread <- scotty_p %>% 
+  spread(src_sub_area, demand)
+
+# type of scale is square root, center, scale
+rec <- recipe(~ ., filter(scotty_spread)) %>% 
+  step_sqrt(all_numeric()) %>% 
+  step_center(all_numeric()) %>% 
+  step_scale(all_numeric()) %>% 
+  prep()
+
+# running scaling function
+scotty_spread <- bake(rec, scotty_spread)
+
+# return the data into previous format
+scotty_gather <- scotty_spread %>%  
+  gather(src_sub_area, demand, -datetime, -sample)
+
+# inspect the data
+head(scotty_gather)
+```
+
+After the data is scaled, I create function to revert the data back to its original value before scaling.
+
+```{r}
+rec_revert <- function(vector, rec, varname) {
+  rec_center <- rec$steps[[2]]$means[varname]
+  rec_scale <- rec$steps[[3]]$sds[varname]
+  results <- (vector * rec_scale + rec_center) ^ 2
+  results <- round(results)
+  results
+}
+```
+
+Next, both train and test data will be nested to make it easier to choose the best model.
+
+```{r}
+scotty_nest <- scotty_gather  %<>%
+  group_by(src_sub_area, sample) %>% 
+  nest(.key = "data") %>% 
+  spread(sample, data)
+
+scotty_nest
+```
+
+```{r}
+submit_nest <- data_submission %>% nest(datetime)
+```
+
+Next, we create time series and multiple seasonality time series object. This two time series modelling will be tested and we will see which time series object deliver the least error when the prediction is made. 
+
+```{r}
+# create list from object function
+data_funs <- list(
+  ts = function(x) ts(x$demand, frequency = 24),
+  msts = function(x) msts(x$demand, seasonal.periods = c(24, 24 * 7))
+)
+
+# transform function into data frame so it can be gathered with dataset
+data_funs %<>% 
+  rep(length(unique(scotty_nest$src_sub_area))) %>% 
+  enframe("data_fun_name", "data_fun") %>% 
+  mutate(src_sub_area = 
+           sort(rep(unique(scotty_nest$src_sub_area), length(unique(.$data_fun_name))))
+         )
+
+# gather with dataset
+scotty_join <- scotty_nest %>%  left_join(data_funs)
+```
+
+Let's check the data that is already gathered.
+```{r}
+head(scotty_join)
+```
+
+# Modelling
+
+Next, we will create a list of model algorithm that will applied in dataset. I will use the models as below:
+1. Exponential Smoothing State Space Model (ets)
+2. Seasonal and Trend decomposition using Loss (stlm)
+3. Trigonometric seasonality, Box-Cox transformation, ARMA errors, Trend, and Seasonal components (tbats)
+4. Autoregressive integrated moving average (ARIMA)
+5. Holt-Winters
+
+I will try all algorithm above, and see which model give least error when doing prediction. For ets and arima model in particular, will not be applied in multiple seasonal time series since those two models are not compatible with it.
+
+```{r}
+# create list from model
+models <- list(
+  ets = function(x) ets(x),
+  stlm = function(x) stlm(x),
+  tbats = function(x) tbats(x),
+  auto.arima = function(x) auto.arima(x),
+  holt.winters = function(x) HoltWinters(x, seasonal = "additive")
+)
+
+# transform function into data frame so it can be gathered with dataset
+models <- models %>% 
+  rep(length(unique(scotty_nest$src_sub_area))) %>% 
+  enframe("model_name", "model") %>% 
+  mutate(src_sub_area =
+           sort(rep(unique(scotty_nest$src_sub_area), length(unique(.$model_name))))
+         )
+
+models
+```
+
+Next, we will combine the model with dataset, and also exclude ets and arima model when we deal with multiple seasonality time series.
+
+```{r}
+scotty_nest_model <- scotty_join %>% 
+  left_join(models) %>% 
+  filter(!(model_name == "ets" & data_fun_name == "msts"),
+         !(model_name == "auto.arima" & data_fun_name == "msts"))
+```
+
+```{r}
+head(scotty_nest_model)
+```
+
+Then, we apply time series object function and algorithm model toward dataset
+
+```{r}
+scotty_nest_model <- scotty_nest_model %>%
+  mutate(
+    params = map(train, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)),
+    fitted = invoke_map(model, params)
+  ) %>%
+  select(-data, -params)
+
+```
+
+```{r}
+scotty_nest_model
+```
+
+# Evaluation
+
+This subsection will show error calculation for the prediction that is done toward data test by each model
+
+```{r}
+scotty_error <- scotty_nest_model %>% 
+  mutate(error =
+           map(fitted, ~ forecast(.x, h = 24 * 7)) %>% 
+           map2_dbl(test, ~ mae_vec(truth = rec_revert(.y$demand, rec, src_sub_area), estimate = rec_revert(.x$mean, rec, src_sub_area)))) %>% 
+  arrange(src_sub_area, error)
+
+scotty_error %>% 
+  select(src_sub_area, ends_with("_name"), error)
+```
+
+Next, we get the best model by choosing the smallest error.
+```{r}
+scotty_best_model <- scotty_error %>%
+  group_by(src_sub_area) %>% 
+  arrange(error) %>% 
+  slice(1) %>%  
+  ungroup() %>% 
+  select(src_sub_area, ends_with("_name"),error)
+```
+
+Do left join in order to get the whole information regarding the best model.
+
+```{r}
+scotty_best_model <- scotty_best_model %>% 
+  select(-error) %>% 
+  left_join(scotty_error)%>% 
+  select(-error)
+```
+
+Let's check our best model.
+
+```{r}
+scotty_best_model
+```
+
+Next, we create visualization that shows the difference between prediction result from each model (green line) compared to real demand data (black line).
+
+```{r}
+# forecast to dataset
+scotty_test <- scotty_error %>% 
+  mutate(
+    forecast =
+      map(fitted, ~ forecast(.x, h = 24 * 7)) %>% 
+      map2(test, ~ tibble(
+        datetime = .y$datetime,
+        demand = as.vector(.x$mean)
+      )),
+    key = paste(data_fun_name, model_name, sep = "-")
+  )
+
+scotty_test
+
+# form data for viz
+scotty_test %<>%
+  select(src_sub_area, key, actual = test, forecast) %>% 
+  spread(key, forecast) %>% 
+  gather(key, value, -src_sub_area) %>% 
+  unnest(value) %>% 
+  mutate(demand = rec_revert(demand, rec, src_sub_area))
+
+# Viz
+color <- "forestgreen"
+
+ggplot(scotty_test, aes(x = datetime, y = demand)) +
+  geom_line(data = scotty_test %>% filter(key == "actual"), aes(y = demand), alpha = 0.2, size = 0.8) +
+  geom_line(data = scotty_test %>% filter(key != "actual"), aes(frame = key, col = key)) +
+  labs(x = "", y = "Demand (order", title = "Comparison between models", frame="Models") +
+  facet_wrap(~ src_sub_area, scale = "free_y", ncol = 1) +
+  scale_color_manual(values = c(color, color, color, color, color, color, color, color, color)) +
+  theme(legend.position = "none")
+```
+
+Now, let's choose the model that have smallest prediction error for each sub-area.
+
+```{r}
+# select least error
+scotty_min_error <- scotty_error %>% 
+  select(-fitted) %>% 
+  group_by(src_sub_area) %>% 
+  filter(error == min(error)) %>% 
+  ungroup()
+
+# combining train and test data
+scotty_full <- scotty_min_error %>% 
+  mutate(fulldata = map2(train, test, ~ bind_rows(.x, .y))) %>% 
+  select(src_sub_area, fulldata, everything(), -train, -test)
+
+scotty_full
+```
+
+tbats model have least error for each sub-area. then, we combine test and train data to form final model.
+
+Below shown the modelling by using tbats model toward dataset that is already been combined, then crate demand prediction for the next seven days.
+
+```{r}
+#running the model
+scottyfull_nest <- scotty_full %>%
+  mutate(
+    params = map(fulldata, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)),
+    fitted = invoke_map(model, params)
+  ) %>%
+  select(-data, -params)
+
+# forecasting
+scottyfull_nest <- scottyfull_nest %>% 
+  mutate(forecast =
+           map(fitted, ~ forecast(.x, h = 24 * 7)) %>% 
+           map2(fulldata, ~ tibble(
+             datetime = timetk::tk_make_future_timeseries(.y$datetime, 24 * 7),
+             demand = as.vector(.x$mean)
+           )))
+
+scottyfull_nest
+```
+
+Let's unnest nested data and create visualization from prediction result.
+
+```{r}
+# conceal nest data
+scottyfull_unnest <- scottyfull_nest %>% 
+  select(src_sub_area, actual = fulldata, forecast) %>% 
+  gather(key, value, -src_sub_area) %>% 
+  unnest(value) %>% 
+  mutate(demand = rec_revert(demand, rec, src_sub_area))
+
+# Viz
+ggplot(scottyfull_unnest, aes(x = datetime, y = demand, colour = key)) +
+  geom_line() +
+  labs(y = "Demand(order)", x = NULL, title = "Model Forecasting Result") +
+  facet_wrap(~ src_sub_area, scale = "free_y", ncol = 1) +
+  scale_color_brewer(palette = "Pastel2") +
+  theme(legend.position = "none") 
+```
+
+The unnest data is shown below.
+
+```{r}
+scottyfull_unnest
+```
+
+```{r}
+data_test <- scottyfull_unnest %>% 
+  filter(datetime %within% intest) %>% 
+  select(src_sub_area, datetime, demand)
+
+data_test
+```
+
+# MAE Result for Data Test
+
+```{r}
+mae_test_res <- scotty_error %>%
+  group_by(src_sub_area) %>% 
+  select(src_sub_area, error) %>% 
+  arrange(error) %>% 
+  slice(1) %>% 
+  ungroup()
+
+# Reached MAE < 11 for all sub-area in (your own) test dataset
+# We used tbats - the scale for MAE is a little bit different
+mae_test_res %<>%
+  summarise(src_sub_area = "all sub-area",
+            error = mean(error)) %>%
+  bind_rows(mae_test_res, .)
+
+mae_test_res
+```
+
+
+
+# Data Submission
+
+As the plot above, data shown in the interval: 2017-10-01 00:00:00 - 2017-12-30 23:00:00. We will just prepare 1 week forecast after data train: 2017-12-03 00:00:00 - 2017-12-09 23:00:00
+
+Forecast our data submission using our best model:
+```{r}
+submission <- scotty_best_model %>% #use the best model 
+  mutate(
+    forecast =
+      map(fitted, ~ forecast(.x, h = 24 * 7)) %>%
+      map2(submit_nest$data, ~ tibble( #map into our data submission nest
+        datetime = .y$datetime,
+        demand = as.vector(.x$mean)
+      )),
+    key = paste(data_fun_name, model_name, sep = "-")
+  )
+```
+
+Select only the required columns:
+
+```{r}
+submission <- submission %>%
+  select(src_sub_area, forecast) %>%
+  unnest(forecast) %>%
+  mutate(demand = rec_revert(demand, rec, src_sub_area))
+
+submission
+```
+
+Save submission file into csv.
+
+```{r}
+write_csv(submission, "drive-download-20190915T022902Z-001/scotty-ts-auto/faris_scottyts_capstone.csv")
+```
+
+
+
+
+
+
+
+
